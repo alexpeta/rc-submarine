@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE eagle SYSTEM "eagle.dtd">
+<eagle>
+    <drawing>
+        <grid unitdist="mm" unit="mm"/>
+        <layers>
+            <layer name="Top" color="4" number="1" visible="yes" active="yes" fill="1"/>
+            <layer name="tKeepout" color="0" number="4" visible="yes" active="yes" fill="1"/>
+            <layer name="Bottom" color="4" number="16" visible="yes" active="yes" fill="1"/>
+            <layer name="tPlace" color="7" number="21" visible="yes" active="yes" fill="1"/>
+            <layer name="bPlace" color="7" number="22" visible="yes" active="yes" fill="1"/>
+            <layer name="tNames" color="7" number="25" visible="yes" active="yes" fill="1"/>
+            <layer name="bNames" color="7" number="26" visible="yes" active="yes" fill="1"/>
+            <layer name="tValues" color="7" number="27" visible="yes" active="yes" fill="1"/>
+            <layer name="bValues" color="7" number="28" visible="yes" active="yes" fill="1"/>
+            <layer name="tStop" color="7" number="29" visible="yes" active="yes" fill="1"/>
+            <layer name="bStop" color="7" number="30" visible="yes" active="yes" fill="1"/>
+            <layer name="tCream" color="7" number="31" visible="yes" active="yes" fill="1"/>
+            <layer name="bCream" color="7" number="32" visible="yes" active="yes" fill="1"/>
+            <layer name="bKeepout" color="0" number="40" visible="yes" active="yes" fill="1"/>
+            <layer name="tRestrict" color="4" number="41" visible="yes" active="yes" fill="1"/>
+            <layer name="bRestrict" color="4" number="42" visible="yes" active="yes" fill="1"/>
+            <layer name="tDocu" color="7" number="51" visible="yes" active="yes" fill="1"/>
+            <layer name="bDocu" color="7" number="52" visible="yes" active="yes" fill="1"/>
+            <layer name="Nets" color="2" number="91" visible="yes" active="yes" fill="1"/>
+            <layer name="Busses" color="1" number="92" visible="yes" active="yes" fill="1"/>
+            <layer name="Pins" color="2" number="93" visible="yes" active="yes" fill="1"/>
+            <layer name="Symbols" color="4" number="94" visible="yes" active="yes" fill="1"/>
+            <layer name="Names" color="7" number="95" visible="yes" active="yes" fill="1"/>
+            <layer name="Values" color="7" number="96" visible="yes" active="yes" fill="1"/>
+            <layer name="Info" color="7" number="97" visible="yes" active="yes" fill="1"/>
+            <layer name="Guide" color="6" number="98" visible="yes" active="yes" fill="1"/>
+        </layers>
+        <library name="Upverter Library">
+            <description>Upverter Parts Library
+
+Created by Upverter.com</description>
+            <packages>
+                <package name="ON_SEMICONDUCTOR_2N7000-D26Z_0">
+                    <description>Transistor Mosfet N-ch 60V 0.2A 3-PIN TO-92 T/r</description>
+                    <wire layer="51" y2="2.6" width="0.15" x2="-2.095" y1="-2.6" x1="-2.095"/>
+                    <wire layer="51" y2="2.6" width="0.15" x2="2.095" y1="2.6" x1="-2.095"/>
+                    <wire layer="51" y2="-2.6" width="0.15" x2="2.095" y1="2.6" x1="2.095"/>
+                    <wire layer="51" y2="-2.6" width="0.15" x2="-2.095" y1="-2.6" x1="2.095"/>
+                    <wire layer="21" y2="2.6" width="0.15" x2="-1.48" y1="2.6" x1="-2.095"/>
+                    <wire layer="21" y2="-2.6" width="0.15" x2="-1.48" y1="-2.6" x1="-2.095"/>
+                    <wire layer="21" y2="2.6" width="0.15" x2="-2.095" y1="-2.6" x1="-2.095"/>
+                    <wire layer="41" y2="3.425" width="0.1" x2="-2.195" y1="-3.425" x1="-2.195"/>
+                    <wire layer="41" y2="3.425" width="0.1" x2="2.195" y1="3.425" x1="-2.195"/>
+                    <wire layer="41" y2="-3.425" width="0.1" x2="2.195" y1="3.425" x1="2.195"/>
+                    <wire layer="41" y2="-3.425" width="0.1" x2="-2.195" y1="-3.425" x1="2.195"/>
+                    <wire layer="21" y2="2.6" width="0.15" curve="111.257326859" x2="0.72" y1="-2.6" x1="0.72"/>
+                    <text layer="25" align="bottom-left" y="3.5" x="-2.345" rot="R0" size="1.0">&gt;NAME</text>
+                    <pad diameter="1.45" name="1" shape="square" drill="0.95" y="2.6" x="-0.38" rot="R0"/>
+                    <pad diameter="1.45" name="2" shape="round" drill="0.95" y="0.0" x="-0.38" rot="R0"/>
+                    <pad diameter="1.45" name="3" shape="round" drill="0.95" y="-2.6" x="-0.38" rot="R0"/>
+                </package>
+            </packages>
+            <symbols>
+                <symbol name="ON_SEMICONDUCTOR_2N7000-D26Z_0_0">
+                    <description>Transistor Mosfet N-ch 60V 0.2A 3-PIN TO-92 T/r</description>
+                    <wire layer="94" y2="-2.54" width="0.508" x2="3.556" y1="-7.62" x1="3.556"/>
+                    <wire layer="94" y2="-2.54" width="0.508" x2="4.318" y1="-3.556" x1="4.318"/>
+                    <wire layer="94" y2="-7.112" width="0.508" x2="7.62" y1="-7.112" x1="4.318"/>
+                    <wire layer="94" y2="-3.048" width="0.508" x2="7.62" y1="-3.048" x1="4.318"/>
+                    <wire layer="94" y2="-5.08" width="0.508" x2="7.62" y1="-5.08" x1="5.08"/>
+                    <wire layer="94" y2="-4.318" width="0.508" x2="6.096" y1="-5.08" x1="4.826"/>
+                    <wire layer="94" y2="-5.842" width="0.508" x2="6.096" y1="-5.08" x1="4.826"/>
+                    <wire layer="94" y2="-5.842" width="0.508" x2="6.096" y1="-4.318" x1="6.096"/>
+                    <wire layer="94" y2="-5.588" width="0.508" x2="5.842" y1="-4.826" x1="5.842"/>
+                    <wire layer="94" y2="-7.62" width="0.508" x2="4.318" y1="-6.604" x1="4.318"/>
+                    <wire layer="94" y2="-5.588" width="0.508" x2="4.318" y1="-4.572" x1="4.318"/>
+                    <wire layer="94" y2="-7.112" width="0.508" x2="9.398" y1="-7.112" x1="7.62"/>
+                    <wire layer="94" y2="-3.048" width="0.508" x2="9.398" y1="-7.112" x1="9.398"/>
+                    <wire layer="94" y2="-3.048" width="0.508" x2="7.62" y1="-3.048" x1="9.398"/>
+                    <wire layer="94" y2="-5.588" width="0.508" x2="8.89" y1="-4.572" x1="9.398"/>
+                    <wire layer="94" y2="-5.588" width="0.508" x2="9.906" y1="-5.588" x1="8.89"/>
+                    <wire layer="94" y2="-4.572" width="0.508" x2="9.398" y1="-5.588" x1="9.906"/>
+                    <wire layer="94" y2="-4.572" width="0.508" x2="9.906" y1="-4.572" x1="9.398"/>
+                    <wire layer="94" y2="-4.572" width="0.508" x2="8.89" y1="-4.572" x1="9.398"/>
+                    <wire layer="94" y2="-7.62" width="0.15" x2="3.556" y1="-7.62" x1="2.54"/>
+                    <wire layer="94" y2="-5.08" width="0.15" x2="7.62" y1="-5.08" x1="7.62"/>
+                    <wire layer="94" y2="-3.048" width="0.15" x2="7.62" y1="-2.54" x1="7.62"/>
+                    <text layer="95" align="top-left" y="-2.54" x="10.922" rot="R0" size="2.54">&gt;NAME</text>
+                    <text layer="95" align="top-left" y="-5.334" x="10.922" rot="R0" size="2.54">2N7000-D26Z</text>
+                    <pin direction="pas" name="G" visible="pad" length="middle" y="-7.62" x="-2.54"/>
+                    <pin direction="pas" name="S" visible="pad" length="middle" y="-10.16" x="7.62" rot="R90"/>
+                    <pin direction="pas" name="D" visible="pad" length="middle" y="2.54" x="7.62" rot="R270"/>
+                    <circle y="-3.048" x="7.62" layer="94" radius="0.254" width="0.254"/>
+                    <circle y="-7.112" x="7.62" layer="94" radius="0.254" width="0.254"/>
+                </symbol>
+            </symbols>
+            <devicesets>
+                <deviceset prefix="Q" name="ON_SEMICONDUCTOR_2N7000-D26Z">
+                    <description>Transistor Mosfet N-ch 60V 0.2A 3-PIN TO-92 T/r</description>
+                    <gates>
+                        <gate name="G$0" symbol="ON_SEMICONDUCTOR_2N7000-D26Z_0_0" x="0"/>
+                    </gates>
+                    <devices>
+                        <device name="ON_SEMICONDUCTOR_2N7000-D26Z_0_0" package="ON_SEMICONDUCTOR_2N7000-D26Z_0">
+                            <connects>
+                                <connect gate="G$0" pad="1" pin="S"/>
+                                <connect gate="G$0" pad="2" pin="G"/>
+                                <connect gate="G$0" pad="3" pin="D"/>
+                            </connects>
+                            <technologies>
+                                <technology>
+                                    <attribute name="mouser_part_number" value="512-2N7000D26Z"/>
+                                    <attribute name="depletion_mode" value="False"/>
+                                    <attribute name="turn_on_delay_time" value="10ns"/>
+                                    <attribute name="pulse_drain_current" value="500mA"/>
+                                    <attribute name="mfg_package_ident_rev" value="O"/>
+                                    <attribute name="mouser_description" value="N-Channel 60 V 5 Ohm Enhancement Mode Field Effect Transistor-TO-92"/>
+                                    <attribute name="max_junction_temp" value="+150°C"/>
+                                    <attribute name="temperature_range_high" value="+150°C"/>
+                                    <attribute name="MPN" value="2N7000-D26Z"/>
+                                    <attribute name="gate_to_source_voltage" value="20V"/>
+                                    <attribute name="digikey_description" value="MOSFET N-CH 60V 200MA TO92-3"/>
+                                    <attribute name="device_class_L3" value="MOSFETs"/>
+                                    <attribute name="device_class_L1" value="Discrete Semiconductors"/>
+                                    <attribute name="digikey_part_number" value="2N7000-D26ZCT-ND"/>
+                                    <attribute name="prefix" value="Q"/>
+                                    <attribute name="drain_to_source_resistance" value="1.2Ω"/>
+                                    <attribute name="verification_version" value="0.0.0.3"/>
+                                    <attribute name="transconductance" value="0.32S"/>
+                                    <attribute name="threshold_vgs_max" value="3V"/>
+                                    <attribute name="typ_forward_diode_voltage" value="0.88V"/>
+                                    <attribute name="datasheet" value="https://www.onsemi.com/pdf/datasheet/nds7002a-d.pdf"/>
+                                    <attribute name="power_dissipation" value="400mW"/>
+                                    <attribute name="automotive" value="No"/>
+                                    <attribute name="lead_free" value="Yes"/>
+                                    <attribute name="height" value="8.77mm"/>
+                                    <attribute name="threshold_vgs_min" value="0.8V"/>
+                                    <attribute name="number_of_N_channels" value="1"/>
+                                    <attribute name="mfg_package_ident" value="135AR"/>
+                                    <attribute name="drain_to_source_breakdown_voltage" value="60V"/>
+                                    <attribute name="footprint_variant_name_0" value="Recommended_Land_Pattern"/>
+                                    <attribute name="device_class_L2" value="Transistors"/>
+                                    <attribute name="continuous_drain_current" value="200mA"/>
+                                    <attribute name="input_capacitace_at_vds" value="20pF @ 25V"/>
+                                    <attribute name="temperature_range_low" value="-55°C"/>
+                                    <attribute name="rohs" value="Yes"/>
+                                    <attribute name="centroid_not_specified" value="No"/>
+                                    <attribute name="standoff_height" value="2.54mm"/>
+                                    <attribute name="mfg_package_ident_date" value="09/2016"/>
+                                    <attribute name="turn_off_delay_time" value="10ns"/>
+                                    <attribute name="number_of_channels" value="1"/>
+                                    <attribute name="MF" value="ON Semiconductor"/>
+                                    <attribute name="rthja_max" value="312.5°C/W"/>
+                                    <attribute name="package" value="TO92"/>
+                                    <attribute name="max_forward_diode_voltage" value="1.5V"/>
+                                    <attribute name="drain_to_source_voltage" value="60V"/>
+                                    <attribute name="mfg_package_ident_component_id" value="9652051e5763c9af"/>
+                                </technology>
+                            </technologies>
+                        </device>
+                    </devices>
+                </deviceset>
+            </devicesets>
+        </library>
+    </drawing>
+</eagle>
