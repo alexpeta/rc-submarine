@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Mechanical repo checks for CI. Standard library only; run from the repo root.
+
+    playbook-lint actions-pinned          every workflow `uses:` is pinned to a full commit sha
+    playbook-lint case-collisions         no two tracked paths differ only by case
+    playbook-lint pr-title "<title>"      conventional-commit title, no parentheses past the scope
+    playbook-lint pr-body --file F        no closing keyword next to #N that is negated or quoted
+                          [--forbid 12,13]   (GitHub closes the issue anyway), or that names a number
+                                             you forbid (epics)
+    playbook-lint code [--since REF]      the line rules below, over tests and source
+    playbook-lint all [--since REF]       actions-pinned + case-collisions + code
+    playbook-lint --self-test
+
+Line rules (`code`), each with an escape marker on the line, `<marker>: <reason>`:
+    future-date      a test names a date that is today or later, which turns past mid-run  allow-clock
+    unfrozen-clock   a test reads the real clock (Date.now, new Date(), datetime.now, time.time)  allow-clock
+    fixed-wait       a test sleeps or waits a fixed time or tick count                       allow-fixed-wait
+    log-error-text   a log call prints an error's .message / str(e): it quotes user data     allow-error-message
+    snapshot-update  CI or a config updates snapshots instead of failing on a missing or
+                     changed baseline                                                        allow-snapshot-update
+With `--since REF` only lines the branch added since REF are checked, so a repo with old code
+adopts the rules without a wall of failures. Comment-only lines are skipped.
+
+Optional `.playbook-lint.json` at the repo root: {"test_globs": [...], "source_globs": [...],
+"ignore_globs": [...]} replaces the defaults below. Exit 1 on any finding; one line each:
+`path:line: [rule] message`. Limits, on purpose: a log call or wait split over several lines is
+not seen, and the clock rules do not run the suite at a boundary hour.
+
+Ledger: outside CI (no `CI` in the environment) a run with findings appends one JSON line per rule tag
+(ts, gate, rule, count, repo) to `~/.claude/gate-firings.jsonl`, or to CLAUDE_GATE_FIRINGS_LEDGER. A
+ledger that cannot be written changes neither the output nor the exit.
+"""
+import datetime, json, os, re, subprocess, sys, tempfile, time
+
+TEST_GLOBS = ["**/*.test.*", "**/*.spec.*", "**/test_*.py", "**/*_test.py", "**/tests/**", "**/__tests__/**",
+              "**/test/**"]
+SOURCE_EXT = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py")
+CONFIG_GLOBS = [".github/workflows/*", "package.json", "**/*.config.*", "Makefile", "**/Makefile"]
+TITLE_TYPES = os.environ.get("LINT_TITLE_TYPES", "feat,fix,docs,style,refactor,perf,test,build,ci,chore,revert")
+
+_FUTURE = re.compile(r"\b(2\d{3})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b")
+_CLOCK = re.compile(r"\bDate\.now\(\)|\bnew Date\(\)|\bdatetime\.(?:utc)?now\(|\btime\.time\(\)")
+_WAIT = re.compile(r"\btime\.sleep\(|\basyncio\.sleep\(\s*\d|\bsleep\(\s*\d|\bwaitForTimeout\(|\bwait_for_timeout\(|"
+                   r"\bsetTimeout\([^)]*,\s*\d+|new Promise\([^)]*setTimeout|\bsetImmediate\b|\bprocess\.nextTick\b")
+_LOGERR = re.compile(
+    r"\b(?:logger|log|console)\.(?:debug|info|warn|warning|error|log|trace|exception|critical)\([^\n]*"
+    r"(?:\b(?:err|error|e|ex|exception)\.message\b|\bString\((?:err|error|e)\)|\bstr\((?:e|err|exc|ex|error)\))")
+_SNAP = re.compile(r"--update-snapshots?\b|--snapshot-update\b|UPDATE_SNAPSHOTS\s*=\s*(?:1|true)|"
+                   r"updateSnapshots\s*:\s*['\"](?:all|changed)['\"]|\b(?:vitest|jest)\b[^\n]*\s-u\b")
+_USES = re.compile(r"^\s*-?\s*uses:\s*['\"]?([^\s'\"#]+)")
+_CLOSE = re.compile(r"(?i)\b(clos(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|resolv(?:e[sd]?|ing))\b:?\s+(?:[\w.-]+/[\w.-]+)?#(\d+)")
+_NEGATION = re.compile(r"(?i)\b(?:not|never|no|without|don't|doesn't|won't|isn't|aren't|shouldn't|can't)\b|n't\b")
+_LINE_RULES = [  # (rule, regex, kind, marker, message)
+    ("future-date", _FUTURE, "tests", "allow-clock", "a test names a date that is today or later; derive it from "
+     "the injectable clock the code under test reads"),
+    ("unfrozen-clock", _CLOCK, "tests", "allow-clock", "a test reads the real clock; use the injectable clock "
+     "the code under test reads"),
+    ("fixed-wait", _WAIT, "tests", "allow-fixed-wait", "a test waits a fixed time or tick count; wait on the "
+     "observable outcome with a timeout"),
+    ("log-error-text", _LOGERR, "source", "allow-error-message", "a log call prints an error's message, which "
+     "quotes user data and paths; log its name, code and position"),
+    ("snapshot-update", _SNAP, "config", "allow-snapshot-update", "this updates snapshots instead of failing on "
+     "a missing or changed baseline; update only by hand with an explicit flag"),
+]
+
+
+# ---------------------------------------------------------------- plumbing
+def _rx(g):
+    out, i = [], 0
+    while i < len(g):
+        if g.startswith("**/", i):
+            out.append("(?:.*/)?"); i += 3
+        elif g.startswith("**", i):
+            out.append(".*"); i += 2
+        elif g[i] == "*":
+            out.append("[^/]*"); i += 1
+        elif g[i] == "?":
+            out.append("[^/]"); i += 1
+        else:
+            out.append(re.escape(g[i])); i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def _matches(path, globs):
+    return any(_rx(g).match(path) for g in globs)
+
+
+def _git(*args):
+    p = subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if p.returncode:
+        raise RuntimeError(f"git {' '.join(args)}: {p.stderr.strip()}")
+    return p.stdout
+
+
+def tracked():
+    return [p for p in _git("ls-files", "-z").split("\0") if p]
+
+
+def _config():
+    try:
+        with open(".playbook-lint.json", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def changed_lines(since):
+    """{path: {line numbers added since `since`}} from the branch's own diff."""
+    out, cur = {}, None
+    for ln in _git("diff", "-U0", "--no-color", f"{since}...HEAD").splitlines():
+        if ln.startswith("+++ b/"):
+            cur = ln[6:]
+        elif ln.startswith("@@") and cur:
+            m = re.search(r"\+(\d+)(?:,(\d+))?", ln)
+            start, n = int(m.group(1)), int(m.group(2) or 1)
+            out.setdefault(cur, set()).update(range(start, start + n))
+    return out
+
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+    except OSError:
+        return None
+
+
+def _is_comment(s):
+    t = s.lstrip()
+    return t.startswith(("//", "#", "*", "/*"))
+
+
+# ------------------------------------------------------------------ checks
+def actions_pinned():
+    bad = []
+    for p in tracked():
+        if not (_matches(p, [".github/workflows/*.yml", ".github/workflows/*.yaml", ".github/actions/**/action.yml",
+                             ".github/actions/**/action.yaml"])):
+            continue
+        for n, ln in enumerate(_read(p) or [], 1):
+            m = _USES.match(ln)
+            if not m:
+                continue
+            ref = m.group(1)
+            if ref.startswith("./") or (ref.startswith("docker://") and "@sha256:" in ref):
+                continue
+            if not re.search(r"@[0-9a-f]{40}$", ref):
+                bad.append(f"{p}:{n}: [action-unpinned] `{ref}` is not pinned to a full 40-character commit sha "
+                           "(keep the version in a trailing comment)")
+    return bad
+
+
+def case_collisions():
+    seen, bad = {}, []
+    for p in tracked():
+        parts = p.split("/")
+        for i in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:i])
+            seen.setdefault(prefix.lower(), set()).add(prefix)
+    for low, originals in sorted(seen.items()):
+        if len(originals) > 1:
+            bad.append(f"{sorted(originals)[0]}: [case-collision] paths differ only by case: "
+                       f"{', '.join(sorted(originals))} (one overwrites the other on a case-insensitive disk)")
+    return bad
+
+
+def pr_title(title):
+    t = title.strip()
+    m = re.match(rf"^({'|'.join(re.escape(x) for x in TITLE_TYPES.split(','))})(\([\w./-]+\))?!?: (\S.*)$", t)
+    if not m:
+        return [f"pr-title: [title-grammar] `{t}` is not `<type>(<scope>): <subject>` with a type in "
+                f"{TITLE_TYPES} (the release tool reads this)"]
+    if "(" in m.group(3) or ")" in m.group(3):
+        return [f"pr-title: [title-parens] parentheses in the subject of `{t}`: a squash subject with parentheses "
+                "beyond the scope can fail the release tool's parser and the commit is silently skipped"]
+    return []
+
+
+def pr_body(text, forbid=()):
+    bad, fence = [], False
+    for n, ln in enumerate(text.splitlines(), 1):
+        if ln.lstrip().startswith("```"):
+            fence = not fence
+            continue
+        for m in _CLOSE.finditer(ln):
+            before = ln[: m.start()]
+            why = None
+            if fence:
+                why = "inside a code block"
+            elif before.count("`") % 2 or before.count('"') % 2:
+                why = "quoted"
+            elif _NEGATION.search(before[-60:]):
+                why = "negated"
+            if m.group(2) in forbid:
+                why = (why + ", and " if why else "") + "naming a number you forbid"
+            if why:
+                bad.append(f"pr-body:{n}: [closing-keyword] `{m.group(0)}` is {why}; GitHub still reads it as a "
+                           f"closing keyword. Write `part of #{m.group(2)}` or `leaves #{m.group(2)} open`.")
+    return bad
+
+
+def code(since=None):
+    cfg = _config()
+    tests = cfg.get("test_globs", TEST_GLOBS)
+    ignore = cfg.get("ignore_globs", [])
+    sources = cfg.get("source_globs")
+    only = changed_lines(since) if since else None
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    bad = []
+    for p in tracked():
+        if _matches(p, ignore):
+            continue
+        is_test = _matches(p, tests)
+        is_source = _matches(p, sources) if sources else (p.endswith(SOURCE_EXT) and not is_test)
+        is_config = _matches(p, CONFIG_GLOBS)
+        kinds = {k for k, on in (("tests", is_test), ("source", is_source), ("config", is_config)) if on}
+        if not kinds or (only is not None and p not in only):
+            continue
+        for n, ln in enumerate(_read(p) or [], 1):
+            if (only is not None and n not in only.get(p, ())) or _is_comment(ln):
+                continue
+            for rule, rx, kind, marker, msg in _LINE_RULES:
+                if kind not in kinds or f"{marker}:" in ln:
+                    continue
+                for m in rx.finditer(ln):
+                    if rule == "future-date":
+                        try:
+                            if datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3))) < today:
+                                continue
+                        except ValueError:
+                            continue
+                    bad.append(f"{p}:{n}: [{rule}] {msg} (or mark the line `{marker}: <reason>`)")
+                    break
+    return bad
+
+
+# --------------------------------------------------------------------- CLI
+def _record(bad):
+    """Outside CI, a run with findings appends one line per distinct rule tag (with its count) to the
+    gate-firings ledger; in CI the run is the record and nothing is written. Any error is swallowed."""
+    if not bad or "CI" in os.environ:
+        return
+    try:
+        counts = {}
+        for b in bad:
+            m = re.match(r"^.*?: \[([\w-]+)\]", b)
+            tag = m.group(1) if m else "untagged"
+            counts[tag] = counts.get(tag, 0) + 1
+        try:
+            top = _git("rev-parse", "--show-toplevel").strip()
+        except Exception:
+            top = ""
+        ts, repo = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), top or os.getcwd()
+        path = os.path.expanduser(os.environ.get("CLAUDE_GATE_FIRINGS_LEDGER", "~/.claude/gate-firings.jsonl"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for tag in sorted(counts):
+                f.write(json.dumps({"ts": ts, "gate": "playbook-lint", "rule": tag, "count": counts[tag],
+                                    "repo": repo}) + "\n")
+    except Exception:
+        pass
+
+
+def _report(bad):
+    for b in bad:
+        print(b)
+    _record(bad)
+    return 1 if bad else 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+
+    def opt(name, default=None):
+        return rest[rest.index(name) + 1] if name in rest else default
+
+    try:
+        if cmd == "actions-pinned":
+            return _report(actions_pinned())
+        if cmd == "case-collisions":
+            return _report(case_collisions())
+        if cmd == "pr-title":
+            return _report(pr_title(rest[0]))
+        if cmd == "pr-body":
+            f = opt("--file")
+            text = open(f, encoding="utf-8").read() if f else sys.stdin.read()
+            return _report(pr_body(text, [x for x in opt("--forbid", "").split(",") if x]))
+        if cmd == "code":
+            return _report(code(opt("--since")))
+        if cmd == "all":
+            return _report(actions_pinned() + case_collisions() + code(opt("--since")))
+    except (RuntimeError, IndexError) as e:
+        print(f"playbook-lint: {e}", file=sys.stderr)
+        return 2
+    print(f"playbook-lint: unknown command {cmd!r}", file=sys.stderr)
+    return 2
+
+
+# --------------------------------------------------------------- self-test
+def _self_test():
+    # --self-test counts only as the first argument: after anything else it is not the self-test
+    p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "x", "--self-test"], capture_output=True,
+                       text=True, timeout=60)
+    assert "self-test OK" not in p.stdout and p.returncode != 0, (p.returncode, p.stdout)
+    here, me = os.getcwd(), os.path.abspath(__file__)
+    with tempfile.TemporaryDirectory() as d:
+        os.chdir(d)
+        try:
+            def sh(*a):
+                subprocess.run(a, check=True, capture_output=True)
+
+            def put(path, text):
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+
+            def tags(findings):
+                return sorted({re.search(r"\[([\w-]+)\]", b).group(1) for b in findings})
+
+            sh("git", "init", "-q")
+            sh("git", "config", "user.email", "t@t")
+            sh("git", "config", "user.name", "t")
+            sha = "a" * 40
+
+            # actions-pinned: only the unpinned `uses:` is flagged
+            put(".github/workflows/ci.yml",
+                f"steps:\n  - uses: actions/checkout@{sha} # v4\n  - uses: ./local\n"
+                f"  - uses: docker://alpine@sha256:{sha}\n  - uses: actions/setup-python@v5\n"
+                f"  - uses: docker://alpine:3\n  - run: echo uses: x@v1\n")
+            sh("git", "add", "-A")
+            f = actions_pinned()
+            assert len(f) == 2 and ":5:" in f[0] and "setup-python@v5" in f[0] and ":6:" in f[1], f
+
+            # case-collisions: files and directories. Paths go straight into a scratch repo's index,
+            # because a case-insensitive disk would merge them (which is the failure being tested).
+            assert case_collisions() == []
+            with tempfile.TemporaryDirectory() as d2:
+                os.chdir(d2)
+                sh("git", "init", "-q")
+                blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], input="x", capture_output=True,
+                                      text=True, check=True).stdout.strip()
+                for path in ("Docs/a.md", "docs/b.md", "README.md", "readme.md", "src/ok.md"):
+                    sh("git", "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+                f = case_collisions()
+                assert len(f) == 2 and any("Docs" in b for b in f) and any("README" in b for b in f), f
+                os.chdir(d)
+
+            # pr-title
+            assert pr_title("fix(board): file takes --status") == []
+            assert pr_title("feat: add a thing") == []
+            assert tags(pr_title("hooks: add a thing")) == ["title-grammar"]
+            assert tags(pr_title("Fix the thing")) == ["title-grammar"]
+            assert tags(pr_title("fix(x): handle the case (rare)")) == ["title-parens"]
+
+            # pr-body: unqualified is the author's intent; negated, quoted, fenced and forbidden are not
+            assert pr_body("Closes #12\nPart of #3") == []
+            assert tags(pr_body("This does not close #12")) == ["closing-keyword"]
+            assert tags(pr_body("never `Closes #7` the epic")) == ["closing-keyword"]
+            assert tags(pr_body('the old text said "fixes #9"')) == ["closing-keyword"]
+            assert tags(pr_body("```\nCloses #4\n```")) == ["closing-keyword"]
+            assert pr_body("Closes #12", forbid=["12"]) and not pr_body("Closes #13", forbid=["12"])
+            assert pr_body("Closes #12\nCloses #13", forbid=["13"])[0].startswith("pr-body:2:")
+
+            # code rules: one case per rule, caught by that rule alone
+            put("src/app.test.js",
+                "it('a', () => {\n"
+                "  const t = new Date()\n"
+                "  const d = '2999-01-01'\n"
+                "  const old = '2001-02-03'\n"
+                "  await page.waitForTimeout(500)\n"
+                "  await sleep(10) // allow-fixed-wait: polling a third party\n"
+                "  // new Date() in a comment\n"
+                "  log.warn('x', err.message)\n"
+                "})\n")
+            put("src/clock.js", "const t = Date.now()\nsetTimeout(tick, 100)\n")  # source, not a test
+            put("src/log.js", "log.warn('read failed', err.message)\nlog.warn('read failed', err.code)\n"
+                              "log.warn(e.message) // allow-error-message: test hook\n")
+            put("scripts/t.py", "log.error(str(e))\n")
+            put(".github/workflows/t.yml", f"  - uses: actions/checkout@{sha}\n  - run: npx vitest -u\n"
+                                          "  - run: npx vitest --run\n")
+            sh("git", "add", "-A")
+            f = code()
+            got = sorted(re.match(r"([^:]+):(\d+): \[([\w-]+)\]", b).groups() for b in f)
+            assert got == sorted([("src/app.test.js", "2", "unfrozen-clock"), ("src/app.test.js", "3", "future-date"),
+                                  ("src/app.test.js", "5", "fixed-wait"), ("src/log.js", "1", "log-error-text"),
+                                  ("scripts/t.py", "1", "log-error-text"),
+                                  (".github/workflows/t.yml", "2", "snapshot-update")]), got
+
+            # --since: only the branch's own lines
+            sh("git", "commit", "-q", "-m", "base")
+            sh("git", "branch", "-M", "main")
+            sh("git", "checkout", "-q", "-b", "feat")
+            put("src/new.test.js", "const x = Date.now()\n")
+            put("src/log.js", "log.warn('read failed', err.message)\nlog.warn('read failed', err.code)\n"
+                              "log.warn(e.message) // allow-error-message: test hook\nlog.info(error.message)\n")
+            sh("git", "add", "-A"); sh("git", "commit", "-q", "-m", "work")
+            f = code("main")
+            got = sorted(re.match(r"([^:]+):(\d+): \[([\w-]+)\]", b).groups() for b in f)
+            assert got == sorted([("src/new.test.js", "1", "unfrozen-clock"), ("src/log.js", "4", "log-error-text")]), got
+
+            # config: ignore_globs and a replaced test glob
+            put(".playbook-lint.json", json.dumps({"ignore_globs": ["src/new.test.js"]}))
+            assert [b for b in code("main") if "new.test.js" in b] == []
+
+            # the CLI: exit codes and stdout. Every CLI run points the ledger into this test's own folder, never
+            # the real one: HOME does not move it on Windows (expanduser reads USERPROFILE).
+            with tempfile.TemporaryDirectory() as led:
+                def cli(*args, ledger=os.path.join(led, "scratch.jsonl"), ci=False):
+                    env = {k: v for k, v in os.environ.items() if k != "CI"}
+                    env["CLAUDE_GATE_FIRINGS_LEDGER"] = ledger
+                    if ci:
+                        env["CI"] = "true"
+                    return subprocess.run([sys.executable, me, *args], capture_output=True, text=True, env=env)
+
+                def lines(path):
+                    try:
+                        with open(path, encoding="utf-8") as fh:
+                            return [json.loads(x) for x in fh.read().splitlines()]
+                    except (FileNotFoundError, NotADirectoryError):
+                        return []
+
+                p = cli("pr-title", "bad title")
+                assert p.returncode == 1 and "title-grammar" in p.stdout, (p.returncode, p.stdout, p.stderr)
+                p = cli("pr-title", "fix: ok")
+                assert p.returncode == 0 and not p.stdout
+
+                # the ledger: one line per distinct rule tag with its count, outside CI only
+                findings = code()
+                want = {}
+                for b in findings:
+                    t = re.search(r"\[([\w-]+)\]", b).group(1)
+                    want[t] = want.get(t, 0) + 1
+                assert want["log-error-text"] == 3 and len(want) == 5, want  # the fixture's premise
+                path = os.path.join(led, "code", "gate-firings.jsonl")
+                p = cli("code", ledger=path)
+                assert p.returncode == 1 and not p.stderr, (p.returncode, p.stderr)
+                got = lines(path)
+                assert {x["rule"]: x["count"] for x in got} == want and len(got) == len(want), got
+                for x in got:
+                    assert x["gate"] == "playbook-lint" and sorted(x) == ["count", "gate", "repo", "rule", "ts"], x
+                    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", x["ts"]), x
+                    assert os.path.basename(x["repo"].rstrip("/\\")) == os.path.basename(d), (x, d)
+                path = os.path.join(led, "title.jsonl")
+                p = cli("pr-title", "bad title", ledger=path)
+                assert [(x["rule"], x["count"]) for x in lines(path)] == [("title-grammar", 1)], lines(path)
+                # a clean run writes nothing; in CI nothing is written (the run is the record)
+                path = os.path.join(led, "clean.jsonl")
+                p = cli("pr-title", "fix: ok", ledger=path)
+                assert p.returncode == 0 and lines(path) == []
+                path = os.path.join(led, "ci.jsonl")
+                p = cli("pr-title", "bad title", ledger=path, ci=True)
+                assert p.returncode == 1 and "title-grammar" in p.stdout and lines(path) == [], lines(path)
+                # an unwritable ledger (its parent is a file) changes neither stdout, stderr nor the exit
+                blocker = os.path.join(led, "blocker")
+                with open(blocker, "w") as fh:
+                    fh.write("x")
+                good = cli("code", ledger=os.path.join(led, "good.jsonl"))
+                bad = cli("code", ledger=os.path.join(blocker, "sub", "gate-firings.jsonl"))
+                assert (bad.returncode, bad.stdout, bad.stderr) == (good.returncode, good.stdout, good.stderr) \
+                    and good.returncode == 1 and good.stdout and not good.stderr, (bad.returncode, bad.stderr)
+                assert not os.path.exists(os.path.join(blocker, "sub"))
+        finally:
+            os.chdir(here)
+    print("self-test OK: unpinned actions, case collisions (files and dirs), title grammar and parentheses, "
+          "negated/quoted/fenced/forbidden closing keywords, each line rule alone with its escape marker, "
+          "--since keeps only the branch's lines, config ignore, CLI exit codes; findings write one ledger line "
+          "per rule with its count outside CI, none in CI or on a clean run, and an unwritable ledger changes "
+          "nothing")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--self-test"]:
+        _self_test()
+    else:
+        sys.exit(main(sys.argv[1:]))

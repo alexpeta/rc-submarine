@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Remove the worktrees of finished builders, and nothing else. Standard library; run inside the repo.
+
+    prune-worktrees            dry run: print a verdict for every linked worktree
+    prune-worktrees --apply    remove the ones marked REMOVE (`git worktree remove`, never --force)
+    prune-worktrees --self-test
+
+Why: each builder worktree carries its own dependencies (hundreds of MB to a GB or more). Dozens
+of them fill a disk, and a full disk fails every tool, including the one that would report it.
+Prune at merge, not in a sweep weeks later. But a sweep that deletes by "has no unpushed work" has
+deleted a live builder's worktree: a branch that is not pushed yet is a builder that has not pushed
+yet. So a worktree is REMOVE only when ALL of these hold:
+
+  * its branch has a PR, and every PR for it is MERGED or CLOSED (none open);
+  * its HEAD is contained in a remote ref (`git branch -r --contains`), so no commit is local-only;
+  * `git status --porcelain` is empty, so no uncommitted content;
+  * it is not locked, not detached, and not the main worktree.
+
+A worktree with another worktree inside its folder is kept: removing it would take the inner one's files.
+
+On Windows, when `git worktree remove` fails with its own `error: failed to delete '…'` line (seen for
+a dependency tree past 260 characters; git has by then checked the worktree is clean), the folder is
+deleted through its `\\\\?\\` path, a junction or link removed and never entered, and reported as FORCED.
+No shell reads the path. No other failure is forced, and never an empty path, a drive root, a junction,
+or the main checkout, the checkout this runs in, or a folder above one. A removal that stops half way (a
+file another process holds) is FAILED and says the folder is left for a hand removal: git no longer lists it.
+A worktree this is run from is kept.
+
+Everything else is kept and says why. LIST means "the approver should look" (uncommitted content, or
+commits that exist nowhere else): it is never deleted. KEEP means "not provably finished" (no PR yet,
+an open PR, a lock, a detached HEAD, or `gh` could not answer). Free disk is printed before and after.
+
+Test seam: PRUNE_WORKTREES_PR_STATES='{"branch": ["MERGED"]}' answers the PR lookup without `gh`.
+"""
+import json, ntpath, os, shutil, stat, subprocess, sys, tempfile
+
+
+def _git(*args, cwd=None, check=False):
+    p = subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=cwd)
+    if check and p.returncode:
+        raise RuntimeError(f"git {' '.join(args)}: {p.stderr.strip()}")
+    return p
+
+
+def worktrees(cwd=None):
+    """[{path, head, branch, locked, detached}] for every linked worktree (the main one is skipped)."""
+    out, cur = [], None
+    for ln in _git("worktree", "list", "--porcelain", cwd=cwd, check=True).stdout.splitlines() + [""]:
+        if not ln:
+            if cur:
+                out.append(cur)
+            cur = None
+        elif ln.startswith("worktree "):
+            cur = {"path": ln[9:], "head": "", "branch": None, "locked": False, "detached": False, "bare": False}
+        elif cur is not None:
+            if ln.startswith("HEAD "):
+                cur["head"] = ln[5:]
+            elif ln.startswith("branch "):
+                cur["branch"] = ln[7:].removeprefix("refs/heads/")
+            elif ln == "detached":
+                cur["detached"] = True
+            elif ln.startswith("locked"):
+                cur["locked"] = True
+            elif ln == "bare":
+                cur["bare"] = True
+    return out[1:]  # the first entry is the main worktree
+
+
+def pr_states(branch, cwd=None):
+    seam = os.environ.get("PRUNE_WORKTREES_PR_STATES")
+    if seam is not None:
+        return json.loads(seam).get(branch, [])
+    p = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "all", "--json", "state", "--limit", "20",
+                        "--jq", ".[].state"], capture_output=True, text=True, cwd=cwd, timeout=20)
+    if p.returncode:
+        raise RuntimeError(p.stderr.strip() or "gh failed")
+    return p.stdout.split()
+
+
+def verdict(w, cwd=None):
+    """(REMOVE | LIST | KEEP, reason)."""
+    if w["locked"]:
+        return "KEEP", "locked"
+    if w["detached"] or not w["branch"]:
+        return "KEEP", "detached HEAD: no branch to look up"
+    if not os.path.isdir(w["path"]):
+        return "KEEP", "directory is missing (run `git worktree prune`)"
+    if _git("status", "--porcelain", cwd=w["path"]).stdout.strip():
+        return "LIST", "uncommitted content: the approver should look"
+    if not _git("branch", "-r", "--contains", w["head"], cwd=w["path"]).stdout.strip():
+        return "LIST", "commits that exist in no remote ref: the approver should look"
+    try:
+        states = pr_states(w["branch"], cwd)
+    except Exception as e:
+        return "KEEP", f"could not read the PR state ({str(e)[:60]})"
+    if not states:
+        return "KEEP", "no PR yet: may be a live builder that has not reported"
+    if "OPEN" in states:
+        return "KEEP", "PR is open"
+    return "REMOVE", f"PR {'/'.join(sorted(set(states))).lower()}, clean, fully pushed"
+
+
+def _force_refusal(path, keep):
+    """Why `path` may not be force-removed, or None; `keep` is the checkouts that must stay. Pure and on
+    ntpath, so it is tested on every platform."""
+    if not path or not path.strip():
+        return "an empty path"  # `\\?\` plus nothing targets the root
+    p = ntpath.normpath(path)
+    drive, tail = ntpath.splitdrive(p)
+    if len(drive) != 2 or drive[1] != ":" or not tail.startswith("\\"):
+        return "not an absolute drive path"
+    if not tail.strip("\\"):
+        return "a drive root"
+    a = ntpath.normcase(p).rstrip("\\")
+    for k in keep:
+        t = ntpath.normcase(ntpath.normpath(k)).rstrip("\\")
+        if a == t or t.startswith(a + "\\"):
+            return "the main checkout, the checkout this runs in, or a folder above one"
+    return None
+
+
+def _may_force(stderr):
+    """git's own delete failure, as a whole line. Its refusal of a dirty worktree starts `fatal: '<path>'`, so a
+    path that holds the words cannot pass for it."""
+    return os.name == "nt" and any(ln.startswith("error: failed to delete '") for ln in stderr.splitlines())
+
+
+def _is_link(st):
+    return bool(getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)) or stat.S_ISLNK(st.st_mode)
+
+
+def _remove_tree(d):
+    """Delete the folder `d` and what is in it. A junction or link is removed as itself and never entered."""
+    with os.scandir(d) as it:
+        entries = list(it)
+    for e in entries:
+        st = e.stat(follow_symlinks=False)
+        if _is_link(st):
+            try:
+                os.rmdir(e.path)  # a junction or a link to a folder
+            except OSError:
+                os.unlink(e.path)
+        elif stat.S_ISDIR(st.st_mode):
+            _remove_tree(e.path)
+        else:
+            try:
+                os.unlink(e.path)
+            except PermissionError:  # a read-only file
+                os.chmod(e.path, stat.S_IWRITE)
+                os.unlink(e.path)
+    try:
+        os.rmdir(d)
+    except PermissionError:  # a read-only folder
+        os.chmod(d, stat.S_IWRITE)
+        os.rmdir(d)
+
+
+def _real(q):
+    return os.path.normcase(os.path.realpath(q)).rstrip("\\/")
+
+
+def _force_remove(path, keep):
+    """Windows, and only after `git worktree remove` failed to delete a folder it had judged clean: delete it
+    through its `\\\\?\\` path, which reaches files past 260 characters. The path goes to the file system as it
+    is: no shell reads it (cmd.exe cut `a&b` at the `&` and expanded `%OS%`, and removed another folder, on
+    the second read of this change, 2026-11-10). None = gone; otherwise why not."""
+    why = _force_refusal(path, keep)
+    if why:
+        return f"not forced ({why})"
+    # the same refusal on the folders themselves, whatever the spelling (an 8.3 short name, a junction above)
+    if any(_real(k) == _real(path) or _real(k).startswith(_real(path) + os.sep) for k in keep):
+        return "not forced (it is, or holds, the main checkout or the checkout this runs in)"
+    long = "\\\\?\\" + ntpath.normpath(path)
+    try:
+        st = os.lstat(long)
+    except FileNotFoundError:
+        return "not forced (the folder is already gone: git's error was about something else)"
+    if _is_link(st):
+        return "not forced (the folder is a junction or a link)"
+    try:
+        _remove_tree(long)
+    except (OSError, RecursionError) as e:
+        return (f"the removal through the \\\\?\\ path stopped: {e}; what is left of the folder must be removed by hand, "
+                "git no longer lists it")
+    return None
+
+
+def _inner(path, every):
+    """Another worktree's folder that lies inside `path`, or None."""
+    a = _real(path)
+    return next((o for o in every if _real(o).startswith(a + os.sep)), None)
+
+
+def _free(path):
+    return shutil.disk_usage(path).free / 2**30
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    apply = "--apply" in argv
+    unknown = [a for a in argv if a not in ("--apply",)]
+    if unknown:
+        print(f"prune-worktrees: unknown option {unknown[0]}", file=sys.stderr)
+        return 64
+    top = _git("rev-parse", "--show-toplevel").stdout.strip()
+    if not top:
+        print("prune-worktrees: not inside a git repository", file=sys.stderr)
+        return 64
+    every = [ln[9:] for ln in _git("worktree", "list", "--porcelain", cwd=top).stdout.splitlines() if ln.startswith("worktree ")]
+    rows = [(*verdict(w, top), w) for w in worktrees(top)]
+    for i, (v, why, w) in enumerate(rows):  # git would delete the inner worktree's files with the outer folder
+        inner = _inner(w["path"], every) if v == "REMOVE" else None
+        if v == "REMOVE" and _real(w["path"]) == _real(top):
+            rows[i] = ("KEEP", "the checkout this runs in", w)
+        elif inner:
+            rows[i] = ("KEEP", f"another worktree lives inside it ({inner})", w)
+    order = {"REMOVE": 0, "LIST": 1, "KEEP": 2}
+    rows.sort(key=lambda r: order[r[0]])
+    print(f"free disk: {_free(top):.1f} GiB")
+    for v, why, w in rows:
+        print(f"{v:6} {w['path']} ({w['branch'] or 'detached'}): {why}")
+    n = sum(1 for r in rows if r[0] == "REMOVE")
+    failed = 0
+    if apply:
+        for v, why, w in rows:
+            if v != "REMOVE":
+                continue
+            p = _git("worktree", "remove", w["path"], cwd=top)
+            if p.returncode:
+                # git checks the worktree is clean before it deletes, and after a failed delete it keeps no record
+                # of the worktree (probed, git 2.52). Any other failure (dirty since the verdict, a lock) is never forced.
+                left = _force_remove(w["path"], [top] + every[:1]) if _may_force(p.stderr) else None
+                if left is None and _may_force(p.stderr):
+                    print(f"FORCED {w['path']}: `git worktree remove` could not delete it; removed through its \\\\?\\ path")
+                    continue
+                failed += 1
+                print(f"FAILED {w['path']}: {p.stderr.strip()}" + (f" ({left})" if left else ""), file=sys.stderr)
+        print(f"removed {n - failed} of {n}; free disk: {_free(top):.1f} GiB")
+    else:
+        print(f"{n} to remove, {sum(1 for r in rows if r[0] == 'LIST')} to look at, "
+              f"{sum(1 for r in rows if r[0] == 'KEEP')} kept. Dry run: pass --apply to remove.")
+    return 1 if failed else 0
+
+
+def _self_test():
+    # --self-test counts only as the first argument: after anything else it is not the self-test
+    p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "x", "--self-test"], capture_output=True,
+                       text=True, timeout=60)
+    assert "self-test OK" not in p.stdout and p.returncode != 0, (p.returncode, p.stdout)
+    me = os.path.abspath(__file__)
+    py = sys.executable
+    with tempfile.TemporaryDirectory() as d:
+        def sh(*a, cwd=None):
+            subprocess.run(a, cwd=cwd or main_repo, check=True, capture_output=True)
+
+        origin, main_repo = os.path.join(d, "origin.git"), os.path.join(d, "main")
+        os.makedirs(main_repo)
+        subprocess.run(["git", "init", "-q", "--bare", origin], check=True)
+        sh("git", "init", "-q", "-b", "main")
+        for k, v in (("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false"), ("core.longpaths", "false")):
+            sh("git", "config", k, v)
+        with open(os.path.join(main_repo, "f.txt"), "w") as f:
+            f.write("0\n")
+        sh("git", "add", "-A"); sh("git", "commit", "-q", "-m", "base")
+        sh("git", "remote", "add", "origin", origin)
+        sh("git", "push", "-q", "-u", "origin", "main")
+
+        def wt(name, commit=True, push=True, folder=None):
+            path = folder or os.path.join(d, name)
+            sh("git", "worktree", "add", "-q", "-b", name, path, "main")
+            if commit:
+                with open(os.path.join(path, name + ".txt"), "w") as f:
+                    f.write(name)
+                sh("git", "add", "-A", cwd=path); sh("git", "commit", "-q", "-m", name, cwd=path)
+            if push:
+                sh("git", "push", "-q", "origin", name, cwd=path)
+            return path
+
+        paths = {
+            "merged": wt("merged"), "closed": wt("closed"), "dirty": wt("dirty"), "localonly": wt("localonly", push=False),
+            "placeholder": wt("placeholder", commit=False, push=False), "open": wt("open"), "locked": wt("locked"),
+            "mixed": wt("mixed"), "gone": wt("gone"),
+        }
+        # a merged, clean worktree with a live one inside an ignored folder of it (what `.claude/worktrees/` gives)
+        with open(os.path.join(main_repo, ".git", "info", "exclude"), "a") as f:
+            f.write("nested/\ndeep/\njunction/\n")
+        paths["outer"] = wt("outer")
+        paths["inner"] = wt("inner", folder=os.path.join(paths["outer"], "nested", "inner"))
+        with open(os.path.join(paths["dirty"], "scratch.txt"), "w") as f:
+            f.write("wip")
+        sh("git", "worktree", "lock", paths["locked"])
+        sh("git", "worktree", "add", "-q", "--detach", os.path.join(d, "detached"), "main")
+        shutil.rmtree(paths["gone"], ignore_errors=True)  # a directory deleted by hand
+        env = dict(os.environ, PRUNE_WORKTREES_PR_STATES=json.dumps({
+            "merged": ["MERGED"], "closed": ["CLOSED"], "dirty": ["MERGED"], "localonly": ["MERGED"], "open": ["OPEN"],
+            "locked": ["MERGED"], "mixed": ["MERGED", "OPEN"], "gone": ["MERGED"], "outer": ["MERGED"], "inner": ["OPEN"]}))
+
+        def run(*a):
+            return subprocess.run([py, "-I", me, *a], cwd=main_repo, capture_output=True, text=True, env=env)
+
+        def verdicts(out):
+            return {os.path.basename(ln.split()[1]): ln.split()[0] for ln in out.splitlines()
+                    if ln.split()[0] in ("REMOVE", "LIST", "KEEP")}
+
+        p = run()
+        assert p.returncode == 0, p.stderr
+        assert verdicts(p.stdout) == {"merged": "REMOVE", "closed": "REMOVE", "dirty": "LIST", "localonly": "LIST",
+                                      "placeholder": "KEEP", "open": "KEEP", "locked": "KEEP", "mixed": "KEEP",
+                                      "detached": "KEEP", "gone": "KEEP", "outer": "KEEP", "inner": "KEEP"}, p.stdout
+        assert "another worktree lives inside it" in p.stdout, p.stdout
+        q = subprocess.run([py, "-I", me], cwd=paths["merged"], capture_output=True, text=True, env=env)
+        assert verdicts(q.stdout)["merged"] == "KEEP" and "the checkout this runs in" in q.stdout, q.stdout
+        assert all(os.path.isdir(x) for k, x in paths.items() if k != "gone"), "a dry run removed something"
+        for why in ("no PR yet", "uncommitted", "no remote ref", "detached HEAD", "directory is missing", "locked",
+                    "PR is open"):
+            assert why in p.stdout, (why, p.stdout)
+        p = run("--apply")
+        assert p.returncode == 0 and "removed 2 of 2" in p.stdout, (p.stdout, p.stderr)
+        assert not os.path.exists(paths["merged"]) and not os.path.exists(paths["closed"])
+        assert all(os.path.isdir(paths[k]) for k in ("dirty", "localonly", "placeholder", "open", "locked", "mixed", "outer", "inner"))
+        assert not os.path.exists(paths["gone"])
+        assert os.path.isdir(os.path.join(d, "detached")) and os.path.isdir(main_repo)
+        # gh unavailable: nothing is removed on a guess
+        env["PRUNE_WORKTREES_PR_STATES"] = "not json"
+        p = run("--apply")
+        assert p.returncode == 0 and "removed 0 of 0" in p.stdout and os.path.isdir(paths["open"]), p.stdout
+        assert run("--bogus").returncode == 64
+        # what may never be force-removed, on every platform
+        top = ["C:/other/main", "C:/repos/app"]
+        for bad, why in (("", "empty"), ("  ", "empty"), ("C:\\", "drive root"), ("C:/", "drive root"), ("wt", "absolute"),
+                         ("C:wt", "absolute"), ("\\\\srv\\share\\wt", "absolute"), ("/tmp/wt", "absolute"),
+                         ("C:/repos/app", "main checkout"), ("c:\\REPOS\\app\\", "main checkout"), ("C:/repos", "main checkout")):
+            assert why in (_force_refusal(bad, top) or ""), (bad, _force_refusal(bad, top))
+        assert _force_refusal("C:/repos/app-wt", top) is None and _force_refusal("C:/repos/app/.claude/worktrees/a", top) is None
+        assert not _may_force("fatal: 'C:/wt' contains modified or untracked files, use --force to delete it"), "a dirty worktree is never forced"
+        assert not _may_force("fatal: 'C:/failed to delete/wt' contains modified or untracked files, use --force to delete it")
+        assert _may_force("error: failed to delete 'C:/wt': Filename too long") == (os.name == "nt")
+        if os.name != "nt":
+            long_path = "the long-path removal itself is Windows only and was not run here"
+        else:
+            # A clean, merged worktree with an ignored tree past 260 characters, and a junction to a folder outside it.
+            # 8-letter folder names: with longer ones rmdir walks the 8.3 short names and the test passes vacuously.
+            # Its folder name holds what cmd.exe would read (`&`, `%OS%`, `^`), beside the folder cmd would have cut it to.
+            lp, outside, cut = wt("longpath", folder=os.path.join(d, "lp&rem%OS%^x")), os.path.join(d, "outside"), os.path.join(d, "lp")
+            for keep in (outside, cut):
+                os.makedirs(keep)
+                with open(os.path.join(keep, "keep.txt"), "w") as f:
+                    f.write("not the worktree's")
+            import _winapi  # a junction made without cmd.exe, which would read the folder's name
+            _winapi.CreateJunction(outside, os.path.join(lp, "junction"))
+            deep = "\\\\?\\" + os.path.join(lp, "deep", *["abcdefgh"] * 32)
+            os.makedirs(deep)
+            with open(deep + "\\f.txt", "w") as f:
+                f.write("x")
+            os.chmod(deep + "\\f.txt", stat.S_IREAD)
+            os.makedirs(os.path.join(lp, "deep", "readonly"))
+            os.chmod(os.path.join(lp, "deep", "readonly"), stat.S_IREAD)
+            subprocess.run(["attrib", "+r", os.path.join(lp, "deep", "readonly")], check=True, capture_output=True)
+            env["PRUNE_WORKTREES_PR_STATES"] = json.dumps({"longpath": ["MERGED"], "dirty": ["OPEN"]})
+            try:
+                assert len(deep) > 300 and verdicts(run().stdout)[os.path.basename(lp)] == "REMOVE"
+                p = run("--apply")
+                assert p.returncode == 0 and "FORCED" in p.stdout and "removed 1 of 1" in p.stdout, (p.stdout, p.stderr)
+                assert not os.path.exists(lp), "the long-path worktree is gone"
+                assert os.path.isfile(os.path.join(outside, "keep.txt")), "a junction is removed, never followed"
+                assert os.path.isfile(os.path.join(cut, "keep.txt")), "no shell read the path: the folder beside it stays"
+                assert "longpath" not in _git("worktree", "list", cwd=main_repo).stdout, "git keeps no record of it"
+                assert (_force_remove(os.path.join(d, "nope"), [main_repo]) or "").startswith("not forced (the folder is already gone")
+                assert "junction or a link" in (_force_remove(os.path.join(d, "jl"), [main_repo]) if not _winapi.CreateJunction(outside, os.path.join(d, "jl")) else "")
+                assert os.path.isfile(os.path.join(outside, "keep.txt"))
+                # a junction to the folder that holds the main checkout: refused for what it is, not for its spelling
+                _winapi.CreateJunction(d, os.path.join(outside, "up"))
+                assert "holds, the main checkout" in _force_remove(os.path.join(outside, "up"), [main_repo]) and os.path.isdir(main_repo)
+                os.rmdir(os.path.join(outside, "up"))
+            finally:  # a red here must not leave a tree the temp folder's own cleanup cannot delete
+                if os.path.exists(lp):
+                    _remove_tree("\\\\?\\" + lp)
+            long_path = "on Windows a worktree git cannot delete for a long path is removed through the \\\\?\\ path, its junction not followed"
+    print(f"self-test, long path: {long_path}")
+    print("self-test OK: a worktree is removed only when its PR is merged or closed, it is clean and fully pushed; "
+          "dirty or local-only ones are listed for the approver; no PR, an open PR, a lock, a detached HEAD or an "
+          "unreadable PR state are kept; a dry run removes nothing; only --apply removes, without --force")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--self-test"]:
+        _self_test()
+    else:
+        sys.exit(main(sys.argv[1:]))
