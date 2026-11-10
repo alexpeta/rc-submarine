@@ -1,2 +1,7 @@
 .claude/worktrees/
 .claude/lessons/
+
+# Eagle autosave backups
+*.s#*
+*.b#*
+*.l#*
