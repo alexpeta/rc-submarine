@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Make one mutation, run the tests, restore, and say whether the tests caught it. Standard library only.
+
+    mutate --file PATH --old TEXT --new TEXT [--timeout SECONDS] [--tail N] [--log PATH] -- <test command>
+    mutate --self-test
+
+The by-hand ritual (commit first, replace with the Edit tool, run, undo, `git diff --quiet`) is
+one checked step here. What it guarantees, each a hole a hand-rolled harness fell into:
+
+  * The mutation APPLIED. `--old` must occur in the file exactly once (none: nothing was
+    mutated and a green would mean nothing; several: ambiguous), and the file must differ after
+    the write. Otherwise exit 2 and the file is untouched. In a file with CRLF line endings an
+    `--old` written with "\\n" also matches its CRLF form, and `--new` is written with CRLF there.
+  * Restored in the caller, from the original bytes, whatever the test did: red, green, timeout,
+    Ctrl-C, or a crash of this script's own bookkeeping. Then `git status` must show the same tracked
+    changes as before: the file was clean, so any difference in it shows too. A test run that
+    dirtied another tracked file (a snapshot rewritten, a generated file) is reported, not hidden.
+  * A TIMEOUT is its own verdict, never a red: the machine is not the guard. A timeout is retried
+    once; if it times out again the verdict is TIMEOUT.
+  * The file's mtime is moved during the run and put back exactly after, so compiled-bytecode and test
+    caches keyed on mtime and size never serve the mutation as the original or the original as the mutation.
+  * The tree must be clean for that file when you start (`git diff --quiet -- PATH`): commit first.
+
+Verdicts and exit codes (note the direction: 0 is the GOOD outcome, the tests caught it):
+    0  RED      the tests failed on the mutation: the guard works. Copy the printed tail's failing
+                assertion into the PR's mutation table.
+    1  GREEN    the tests passed on the mutation: it survived. That is a finding, not a pass. Probe it
+                before calling the test vacuous (does it change observable behaviour? does the
+                control reach this code?).
+    2  not applied (text not found, ambiguous, file dirty, usage): nothing was run.
+    3  NEVER RAN the test command could not start (no such program), or crashed before any test output
+                (module, file or tests not found in the first lines). Not a catch, not a survivor: fix
+                the command and run again.
+    4  TIMEOUT  twice in a row.
+    5  RESTORE   the file or the tree is not back to its original state: stop and look.
+
+The test command runs without a shell, from the REPOSITORY ROOT (`git rev-parse --show-toplevel`
+from the mutated file's directory; the file's own directory when it is not in a repository), whatever
+directory you called mutate from: write the command relative to the root, as CI does. When a RED's output
+shows the tests were never reached, the verdict is NEVER RAN (exit 3), not RED; the output is searched
+only in its first 10 lines, where a start-up crash prints, so a real catch that mentions a missing file
+later in its output stays RED. cmd.exe's "The system cannot find the path specified." counts only when
+it is the whole output. A GREEN or RED here says nothing about code the tests never
+execute: a harness's green covers only what its controls switch on.
+"""
+import os, shutil, signal, subprocess, sys, tempfile, time
+
+RED, GREEN, NOT_APPLIED, NEVER_RAN, TIMEOUT, RESTORE = 0, 1, 2, 3, 4, 5
+
+
+def _git(*args, cwd=None):
+    return subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=cwd)
+
+
+def _tracked_changes(cwd):
+    return _git("status", "--porcelain", "--untracked-files=no", cwd=cwd).stdout.splitlines()
+
+
+def _kill_tree(proc):
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        proc.kill()
+
+
+def _run(cmd, timeout, cwd):
+    """(exit code or None on timeout, combined output, seconds)."""
+    exe = shutil.which(cmd[0]) or cmd[0]
+    kw = {"start_new_session": True} if os.name != "nt" else {}
+    t0 = time.time()
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen([exe, *cmd[1:]], stdout=out, stderr=subprocess.STDOUT, cwd=cwd, **kw)
+        try:
+            code = proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            proc.wait()
+            code = None
+        except BaseException:
+            _kill_tree(proc)
+            raise
+        out.seek(0)
+        return code, out.read().decode("utf-8", errors="replace"), time.time() - t0
+
+
+# Start-up errors: a non-zero exit whose first lines hold one of these never reached a test. Searched only in
+# the first STARTUP_LINES non-empty lines, so a real catch that prints one of them later stays RED. Not here:
+# ENOENT and ModuleNotFoundError, which a mutation can legitimately provoke inside a running test.
+STARTUP_ERRORS = ("MODULE_NOT_FOUND", "Cannot find module", "No test files found", "no tests ran", "No tests found",
+                  "can't open file", "file or directory not found",
+                  "is not recognized as an internal or external command",  # cmd.exe, e.g. through a .cmd shim
+                  "is not recognized as the name of a cmdlet")  # PowerShell
+STARTUP_LINES = 10
+# Too generic to search for in the first lines (a running test can print it): a start-up error only when it is
+# the whole output, which is what cmd.exe prints when the command's first word is a path that does not exist.
+STARTUP_WHOLE = ("The system cannot find the path specified.",)
+
+
+def mutate(path, old, new, cmd, timeout=600.0, tail=12, log=None):
+    path = os.path.abspath(path)
+    filedir = os.path.dirname(path)
+    top = _git("rev-parse", "--show-toplevel", cwd=filedir)
+    cwd = os.path.normpath(top.stdout.strip()) if top.returncode == 0 and top.stdout.strip() else filedir
+    try:
+        with open(path, "rb") as f:
+            original = f.read()
+    except OSError as e:
+        print(f"mutate: cannot read {path}: {e}", file=sys.stderr)
+        return NOT_APPLIED
+    old_b, new_b = old.encode("utf-8"), new.encode("utf-8")
+    n = original.count(old_b)
+    # A working copy checked out with CRLF (Windows, core.autocrlf) never holds an `--old` typed with "\n". Its
+    # CRLF form is counted too, and the CRLF form of `--new` is written for it, so the file keeps its line endings.
+    crlf_old = old_b.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    n_crlf = original.count(crlf_old) if crlf_old != old_b else 0
+    if n + n_crlf != 1:
+        print(f"mutate: NOT APPLIED: `--old` occurs {n + n_crlf} times in {path}, counting a CRLF form of its line "
+              "endings (need exactly 1); nothing was run", file=sys.stderr)
+        return NOT_APPLIED
+    if n_crlf:
+        old_b, new_b = crlf_old, new_b.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    mutated = original.replace(old_b, new_b)
+    if mutated == original:
+        print("mutate: NOT APPLIED: `--new` equals `--old`; nothing was run", file=sys.stderr)
+        return NOT_APPLIED
+    if _git("diff", "--quiet", "--", path, cwd=cwd).returncode != 0:
+        print(f"mutate: NOT APPLIED: {path} has uncommitted changes; commit first so the restore is checkable",
+              file=sys.stderr)
+        return NOT_APPLIED
+    before = _tracked_changes(cwd)
+    st = os.stat(path)
+    result, text, secs = None, "", 0.0
+    try:
+        with open(path, "wb") as f:
+            f.write(mutated)
+        # Compiled-bytecode and test caches key on a file's mtime (Python: whole seconds) and size. A
+        # same-size mutation written in the same second would be served the stale compiled original.
+        # The shift is different every run, or a second mutation would match the first one's cache.
+        shift_ns = (1_000 + int.from_bytes(os.urandom(3), "big")) * 1_000_000_000
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + shift_ns))
+        for attempt in (1, 2):
+            try:
+                code, text, secs = _run(cmd, timeout, cwd)
+            except OSError as e:  # no such program: nothing ran
+                code, text, secs = 0, f"cannot start {cmd[0]!r}: {e}", 0.0
+                result = NEVER_RAN
+                break
+            if code is not None:
+                break
+            print(f"mutate: timed out after {timeout:.0f} s (attempt {attempt} of 2)", file=sys.stderr, flush=True)
+        if result is None:
+            result = TIMEOUT if code is None else (RED if code != 0 else GREEN)
+            head = "\n".join([l for l in text.splitlines() if l.strip()][:STARTUP_LINES])
+            if result == RED and (any(m in head for m in STARTUP_ERRORS) or text.strip() in STARTUP_WHOLE):
+                result = NEVER_RAN
+    finally:
+        with open(path, "wb") as f:  # restore in the caller, from the original bytes
+            f.write(original)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))  # and the original mtime, so caches see the original
+    if log:
+        with open(log, "w", encoding="utf-8") as f:
+            f.write(text)
+    after = _tracked_changes(cwd)
+    if after != before:  # the file was clean at the start, so any content difference shows here too
+        print("mutate: RESTORE PROBLEM: the tracked changes differ from before the run: "
+              + "; ".join(sorted(set(after) ^ set(before))), file=sys.stderr)
+        return RESTORE
+    verdict = {RED: "RED (the tests caught it)", GREEN: "GREEN (the mutation survived: a finding)",
+               TIMEOUT: "TIMEOUT (twice; not a red)",
+               NEVER_RAN: f"NEVER RAN (the tests were not reached; run from {cwd}; not a catch)"}[result]
+    print(f"mutation: {verdict} in {secs:.1f}s; restored, tree verified")
+    if result != TIMEOUT:
+        lines = text.rstrip().splitlines()[-tail:]
+        if lines:
+            print("--- last lines of the test output ---")
+            print("\n".join(lines))
+    return result
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    o = {"timeout": 600.0, "tail": 12, "log": None}
+    i = 0
+    try:
+        while i < len(argv):
+            a = argv[i]
+            if a == "--":
+                cmd = argv[i + 1:]
+                break
+            key = {"--file": "file", "--old": "old", "--new": "new", "--timeout": "timeout", "--tail": "tail",
+                   "--log": "log"}.get(a)
+            if key is None:
+                raise ValueError(f"unknown option {a}")
+            o[key] = {"timeout": float, "tail": int}.get(key, str)(argv[i + 1])
+            i += 2
+        else:
+            raise ValueError("no test command after --")
+        if not cmd or not all(k in o for k in ("file", "old", "new")):
+            raise ValueError("--file, --old, --new and a test command are required")
+    except (ValueError, IndexError) as e:
+        print(f"mutate: {e}", file=sys.stderr)
+        return NOT_APPLIED
+    return mutate(o["file"], o["old"], o["new"], cmd, o["timeout"], o["tail"], o["log"])
+
+
+def _self_test():
+    py = sys.executable
+    me = os.path.abspath(__file__)
+    with tempfile.TemporaryDirectory() as d:
+        def sh(*a):
+            subprocess.run(a, cwd=d, check=True, capture_output=True)
+
+        def mut(old, new, test, *extra):
+            return subprocess.run([py, "-I", me, "--file", os.path.join(d, "m.py"), "--old", old, "--new", new,
+                                   *extra, "--", *test], capture_output=True, text=True)
+
+        src = os.path.join(d, "m.py")
+        with open(src, "w", newline="\n") as f:
+            f.write("def add(a, b):\n    return a + b\n\nNOTE = 'x'\n")
+        with open(os.path.join(d, "other.txt"), "w") as f:
+            f.write("one\n")
+        sh("git", "init", "-q"); sh("git", "config", "user.email", "t@t"); sh("git", "config", "user.name", "t")
+        sh("git", "config", "core.autocrlf", "false")  # the fixture's bytes must survive a checkout
+        sh("git", "add", "-A"); sh("git", "commit", "-q", "-m", "base")
+        original = open(src, "rb").read()
+        checks_add = [py, "-c", "import sys;sys.path.insert(0,r'%s');import m;r=m.add(2,3);print('add(2, 3) ->', r);sys.exit(0 if r==5 else 1)" % d]
+
+        def untouched():
+            assert open(src, "rb").read() == original and _tracked_changes(d) == [], (open(src, "rb").read(), _tracked_changes(d))
+
+        # the mutated file's mtime is moved during the run and restored exactly after
+        seen, before_ns = os.path.join(d, "seen.txt"), os.stat(src).st_mtime_ns
+        mut("NOTE = 'x'", "NOTE = 'y'", [py, "-c", f"import os;open({seen!r},'w').write(str(os.stat({src!r}).st_mtime_ns))"])
+        assert abs(int(open(seen).read()) - before_ns) > 500 * 10**9 and os.stat(src).st_mtime_ns == before_ns
+        # RED: the test catches the mutation; exit 0; the failing output is shown; the file is restored
+        p = mut("return a + b", "return a - b", checks_add)
+        assert p.returncode == 0 and "RED" in p.stdout and "add(2, 3) -> -1" in p.stdout, (p.returncode, p.stdout, p.stderr)
+        untouched()
+        # GREEN: a mutation nothing checks survives; exit 1
+        p = mut("NOTE = 'x'", "NOTE = 'y'", checks_add)
+        assert p.returncode == 1 and "GREEN" in p.stdout, (p.returncode, p.stdout)
+        untouched()
+        # not applied: text missing, ambiguous, no change, dirty file: nothing is run (the marker file proves it)
+        marker = os.path.join(d, "ran.txt")
+        runs = [py, "-c", f"open({marker!r},'w').write('ran')"]
+        assert mut("return a * b", "x", runs).returncode == 2
+        assert mut("a", "b", runs).returncode == 2
+        assert mut("NOTE", "NOTE", runs).returncode == 2
+        assert not os.path.exists(marker)
+        untouched()
+        with open(src, "a") as f:
+            f.write("# dirty\n")
+        assert mut("NOTE = 'x'", "NOTE = 'y'", runs).returncode == 2 and not os.path.exists(marker)
+        sh("git", "checkout", "--", "m.py")
+        # TIMEOUT is its own verdict, retried once, and the file is restored
+        p = mut("NOTE = 'x'", "NOTE = 'y'", [py, "-c", "import time;time.sleep(30)"], "--timeout", "1")
+        assert p.returncode == 4 and "attempt 2 of 2" in p.stderr and "TIMEOUT" in p.stdout, (p.returncode, p.stderr)
+        untouched()
+        # a test run that dirties another tracked file is reported, not hidden
+        p = mut("NOTE = 'x'", "NOTE = 'y'", [py, "-c", f"open({os.path.join(d, 'other.txt')!r},'w').write('changed')"])
+        assert p.returncode == 5 and "other.txt" in p.stderr, (p.returncode, p.stderr)
+        sh("git", "checkout", "--", "other.txt")
+        # a test run that rewrites the mutated file itself is put back to the original bytes
+        p = mut("NOTE = 'x'", "NOTE = 'y'", [py, "-c", f"open({src!r},'w').write('junk')"])
+        assert p.returncode == 1
+        untouched()
+        # `--self-test` after the `--` belongs to the wrapped command: it runs with it, mutate's own self-test does not
+        got = os.path.join(d, "got.txt")
+        p = mut("NOTE = 'x'", "NOTE = 'y'", [py, "-c", f"import sys;open({got!r},'w').write(' '.join(sys.argv[1:]))", "--self-test"])
+        assert p.returncode == 1 and "GREEN" in p.stdout and "self-test OK" not in p.stdout, (p.returncode, p.stdout)
+        assert open(got).read() == "--self-test"
+        untouched()
+        # the log gets the full output
+        log = os.path.join(d, "t.log")
+        mut("return a + b", "return a - b", checks_add, "--log", log)
+        assert os.path.exists(log)
+        # the test command runs from the repository root, so a root-relative command reaches a nested file's tests
+        os.mkdir(os.path.join(d, "sub"))
+        with open(os.path.join(d, "sub", "n.py"), "w", newline="\n") as f:
+            f.write("V = 1\n")
+        with open(os.path.join(d, "check.py"), "w", newline="\n") as f:
+            f.write("import sys\nv = open('sub/n.py').read().strip()\nprint('check:', v)\n"
+                    "sys.exit(0 if v == 'V = 1' else 1)\n")
+        sh("git", "add", "-A"); sh("git", "commit", "-q", "-m", "nested")
+        p = subprocess.run([py, "-I", me, "--file", os.path.join(d, "sub", "n.py"), "--old", "V = 1", "--new", "V = 2",
+                            "--", py, "check.py"], capture_output=True, text=True)
+        assert p.returncode == 0 and "check: V = 2" in p.stdout and "NEVER RAN" not in p.stdout, (p.returncode, p.stdout, p.stderr)
+        # a red whose output shows the tests never ran is its own verdict, exit 3
+        p = subprocess.run([py, "-I", me, "--file", os.path.join(d, "sub", "n.py"), "--old", "V = 1", "--new", "V = 2",
+                            "--", py, "nothing_here.py"], capture_output=True, text=True)
+        assert p.returncode == 3 and "NEVER RAN" in p.stdout and "RED" not in p.stdout, (p.returncode, p.stdout)
+        untouched()
+        # a real catch that mentions a missing file after its test output is still RED
+        late = "for i in range(12): print('test', i)\nprint(\"can't open file\")\nraise SystemExit(1)"
+        p = subprocess.run([py, "-I", me, "--file", os.path.join(d, "sub", "n.py"), "--old", "V = 1", "--new", "V = 2",
+                            "--", py, "-c", late], capture_output=True, text=True)
+        assert p.returncode == 0 and "RED" in p.stdout and "NEVER RAN" not in p.stdout, (p.returncode, p.stdout)
+        # a test program that does not exist is NEVER RAN (exit 3), not a traceback with GREEN's exit code
+        p = subprocess.run([py, "-I", me, "--file", os.path.join(d, "sub", "n.py"), "--old", "V = 1", "--new", "V = 2",
+                            "--", "no-such-runner-xyz"], capture_output=True, text=True)
+        assert p.returncode == 3 and "NEVER RAN" in p.stdout and "Traceback" not in p.stderr, (p.returncode, p.stdout, p.stderr)
+        untouched()
+        # cmd.exe's and PowerShell's "not recognized" start-up errors are NEVER RAN (exit 3), not RED (#75)
+        for msg in ("'node_modules' is not recognized as an internal or external command,\noperable program or batch file.",
+                    "x : The term 'x' is not recognized as the name of a cmdlet, function, script file, or operable program."):
+            p = mut("NOTE = 'x'", "NOTE = 'y'", [py, "-c", f"print({msg!r});raise SystemExit(1)"])
+            assert p.returncode == 3 and "NEVER RAN" in p.stdout and "not recognized" in p.stdout, (msg, p.returncode, p.stdout)
+            untouched()
+        # cmd.exe's "cannot find the path" is NEVER RAN only as the whole output; beside any other line it stays RED (#100)
+        gone = "The system cannot find the path specified."
+        p = mut("NOTE = 'x'", "NOTE = 'y'", [py, "-c", f"print({gone!r});raise SystemExit(1)"])
+        assert p.returncode == 3 and "NEVER RAN" in p.stdout, (p.returncode, p.stdout)
+        p = mut("NOTE = 'x'", "NOTE = 'y'", [py, "-c", f"print('test 1 failed');print({gone!r});raise SystemExit(1)"])
+        assert p.returncode == 0 and "RED" in p.stdout and "NEVER RAN" not in p.stdout, (p.returncode, p.stdout)
+        untouched()
+        # an unencodable character in the tail cannot turn a RED into exit 1 (#96). The child's stdout is a file
+        # encoded as ASCII on every platform: `-I` is dropped for this one run because it ignores PYTHONIOENCODING,
+        # the only way to force a narrow encoding on Linux CI (where a pipe or file is UTF-8 by default).
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+        env["PYTHONIOENCODING"] = "ascii"
+        premise = subprocess.run([py, "-c", "import sys;print(sys.stdout.encoding, sys.stdout.errors)"], env=env,
+                                 capture_output=True, text=True).stdout.split()
+        assert premise == ["ascii", "strict"], premise
+        arrow = [py, "-c", "import sys;sys.stdout.buffer.write('caught \\u2192 here\\n'.encode());raise SystemExit(1)"]
+        out_path = os.path.join(d, "redirected.txt")
+        with open(out_path, "wb") as out:
+            p = subprocess.run([py, me, "--file", src, "--old", "return a + b", "--new", "return a - b", "--", *arrow],
+                               stdout=out, stderr=subprocess.PIPE, env=env)
+        got_out = open(out_path, "rb").read().decode("ascii")
+        assert p.returncode == 0 and "RED" in got_out and "caught \\u2192 here" in got_out, (p.returncode, got_out, p.stderr)
+        untouched()
+        # an `--old` written with "\n" matches its one CRLF occurrence; the mutated file keeps CRLF and the restore
+        # is byte-identical (#96); text not found, or found once in each line ending, is still refused
+        crlf = os.path.join(d, "crlf.txt")
+        with open(crlf, "wb") as f:
+            f.write(b"A = 1\r\nB = 2\r\nC = 3\nD = 4\r\nC = 3\r\nD = 4\r\n")
+        sh("git", "add", "crlf.txt"); sh("git", "commit", "-q", "-m", "crlf")
+        crlf_bytes = open(crlf, "rb").read()
+        seen_b = os.path.join(d, "seen.bin")
+        copy = [py, "-c", f"open({seen_b!r},'wb').write(open({crlf!r},'rb').read());raise SystemExit(1)"]
+
+        def mut_crlf(old, new):
+            return subprocess.run([py, "-I", me, "--file", crlf, "--old", old, "--new", new, "--", *copy],
+                                  capture_output=True, text=True)
+        p = mut_crlf("A = 1\nB = 2", "A = 9\nB = 2")
+        assert p.returncode == 0 and "RED" in p.stdout, (p.returncode, p.stdout, p.stderr)
+        assert open(seen_b, "rb").read() == b"A = 9\r\nB = 2\r\nC = 3\nD = 4\r\nC = 3\r\nD = 4\r\n", open(seen_b, "rb").read()
+        assert open(crlf, "rb").read() == crlf_bytes and _tracked_changes(d) == []
+        os.remove(seen_b)
+        for old in ("A = 1\nX = 2", "C = 3\nD = 4"):  # missing; once with LF and once with CRLF: ambiguous
+            p = mut_crlf(old, "Z")
+            assert p.returncode == 2 and "occurs" in p.stderr and not os.path.exists(seen_b), (old, p.returncode, p.stderr)
+        assert open(crlf, "rb").read() == crlf_bytes
+        # usage
+        for args, why in ((["--file", src], "no test command"), (["--bogus", "1", "--", "x"], "unknown option"),
+                          (["--file", src, "--", "x"], "required")):
+            p = subprocess.run([py, "-I", me, *args], capture_output=True, text=True)
+            assert p.returncode == 2 and why in p.stderr, (args, p.returncode, p.stderr)
+    print("self-test OK: red exits 0 with the output tail; a surviving mutation exits 1; a missing, ambiguous, unchanged "
+          "or dirty-file mutation runs nothing; a timeout is retried and its own verdict; another tracked file dirtied "
+          "is reported; the mutated file is always back to its original bytes; the test command runs from the repository root; a red "
+          "that never reached the tests, or a missing test program, exits 3; a late 'not found' in a real catch stays red; "
+          "cmd.exe's and PowerShell's 'not recognized' exit 3, and cmd.exe's 'cannot find the path' only as the whole output; an unencodable tail character keeps a red at exit 0; an "
+          "`--old` with \\n matches a CRLF file once and the restore is byte-identical")
+
+
+if __name__ == "__main__":
+    # The verdict is the exit code, so printing must never raise: redirected to a file or a pipe on Windows the
+    # streams encode as cp1252 (and `-I` ignores PYTHONIOENCODING), and a test tail holding any character
+    # outside it crashed after a RED with exit 1, which reads as GREEN. An unencodable character prints escaped.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")
+    if sys.argv[1:2] == ["--self-test"]:
+        _self_test()
+    else:
+        sys.exit(main(sys.argv[1:]))

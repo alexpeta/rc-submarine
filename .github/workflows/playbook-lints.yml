@@ -1,0 +1,36 @@
+# Mechanical checks from the playbook (bin/playbook-lint, placed at .github/scripts/playbook-lint).
+# Placed by bin/init; edit freely. Delete the "PR title" step if no release tool reads your
+# commit subjects, and set LINT_TITLE_TYPES if your types differ from the conventional set.
+name: playbook lints
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      # Pinned actions, no case-colliding paths, and the line rules (fixed waits, real clocks in
+      # tests, error text in logs, snapshot updates) over only the lines this PR adds.
+      - name: files and lines this PR adds
+        run: python3 -I .github/scripts/playbook-lint all --since "origin/${{ github.base_ref }}"
+      # Title and body arrive through the environment, never interpolated into the shell line.
+      - name: PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: python3 -I .github/scripts/playbook-lint pr-title "$TITLE"
+      # Add --forbid <epic numbers> to fail any closing keyword that names an epic.
+      - name: PR body
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s' "$BODY" | python3 -I .github/scripts/playbook-lint pr-body

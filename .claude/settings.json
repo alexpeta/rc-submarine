@@ -1,0 +1,68 @@
+{
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "opus",
+    "CLAUDE_CALL_CAP_AGENTS": "builder,builder-sonnet"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CLAUDE_CALL_CAP_AGENTS=builder,builder-sonnet python3 \"${CLAUDE_PROJECT_DIR}/.claude/hooks/call-cap.py\"",
+            "timeout": 5,
+            "statusMessage": "call cap"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PROJECT_DIR}/.claude/hooks/merge-guards.py\"",
+            "timeout": 15,
+            "statusMessage": "merge guards"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CLAUDE_CALL_CAP_AGENTS=builder,builder-sonnet python3 \"${CLAUDE_PROJECT_DIR}/.claude/hooks/call-cap.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CLAUDE_CALL_CAP_AGENTS=builder,builder-sonnet python3 \"${CLAUDE_PROJECT_DIR}/.claude/hooks/call-cap.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CLAUDE_CALL_CAP_AGENTS=builder,builder-sonnet python3 \"${CLAUDE_PROJECT_DIR}/.claude/hooks/call-cap.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
